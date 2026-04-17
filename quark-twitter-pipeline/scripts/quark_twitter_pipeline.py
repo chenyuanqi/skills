@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
 夸克转存 + Twitter 文案一键流水线
 
@@ -7,18 +9,32 @@
 """
 
 import argparse
-import json
 import random
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import httpx
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 # ============ 配置 ============
 DEFAULT_COOKIE_FILE = Path.home() / ".quark_cookie.txt"
+QUARK_REQUIRED = {"pr": "ucpro", "fr": "pc", "uc_param_str": ""}
+QUARK_HEADERS_BASE = {
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    ),
+    "origin": "https://pan.quark.cn",
+    "referer": "https://pan.quark.cn/",
+    "content-type": "application/json;charset=UTF-8",
+    "accept": "application/json, text/plain, */*",
+}
+SHARE_RE = re.compile(r"https?://pan\.quark\.cn/s/([A-Za-z0-9]+)")
 
 # ============ 文案模板 ============
 STYLE_TEMPLATES = {
@@ -72,111 +88,209 @@ STYLE_TEMPLATES = {
 
 
 # ============ 夸克 API ============
+class QuarkError(Exception):
+    pass
+
+
+class QuarkAuthError(QuarkError):
+    pass
+
+
+def ensure_httpx() -> None:
+    if httpx is None:
+        raise RuntimeError("缺少依赖 httpx，请先执行：pip install httpx")
+
+
+def load_cookie_from_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    return lines[0] if lines else ""
+
+
 def make_headers(cookie: str) -> Dict[str, str]:
-    return {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Cookie": cookie,
-        "Origin": "https://pan.quark.cn",
-        "Referer": "https://pan.quark.cn/",
-    }
+    headers = dict(QUARK_HEADERS_BASE)
+    if cookie:
+        headers["cookie"] = cookie
+    return headers
 
 
-def make_params() -> Dict[str, str]:
-    return {"pr": "ucpro", "fr": "pc", "uc_param_str": ""}
+def make_params(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    params: Dict[str, Any] = dict(QUARK_REQUIRED)
+    if extra:
+        params.update(extra)
+    params["__dt"] = random.randint(100, 9999)
+    params["__t"] = int(time.time() * 1000)
+    return params
 
 
 def _check(res: Dict[str, Any], action: str) -> Dict[str, Any]:
-    code = res.get("code")
-    if code != 0:
-        msg = res.get("message", "未知错误")
-        raise RuntimeError(f"{action}失败: {msg} (code={code})")
-    return res.get("data") or res
+    if res.get("status") != 200:
+        code = res.get("code")
+        msg = res.get("message") or str(res)
+        if code == 31001 or "login" in str(msg).lower():
+            raise QuarkAuthError(f"{action}失败：未登录或登录态过期（请重新获取 cookie）")
+        raise QuarkError(f"{action}失败: {msg}")
+    return res.get("data") or {}
 
 
-def api_get_share_detail(client: httpx.Client, share_url: str) -> Dict[str, Any]:
-    """获取分享详情"""
-    match = re.search(r"/s/([a-zA-Z0-9]+)", share_url)
+def extract_pwd_id(share_url: str) -> str:
+    match = SHARE_RE.search(share_url)
     if not match:
-        raise ValueError("无法从 URL 解析分享 ID")
-    share_id = match.group(1)
-    
-    pwd_id = share_id
-    stoken = ""
-    if "?" in share_url:
-        from urllib.parse import parse_qs, urlparse
-        parsed = urlparse(share_url)
-        qs = parse_qs(parsed.query)
-        stoken_list = qs.get("stoken", [""])
-        stoken = stoken_list[0]
-    
-    payload: Dict[str, Any] = {"pwd_id": pwd_id}
-    if stoken:
-        payload["stoken"] = stoken
-    
-    r = client.post(
-        "https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail",
-        headers=make_headers(""),
-        params={**make_params(), "_page": "1", "_size": "50"},
-        json=payload,
+        raise ValueError(f"无法识别夸克分享链接格式，期望 pan.quark.cn/s/xxx，实际：{share_url!r}")
+    return match.group(1)
+
+
+def api_check_login(client: httpx.Client, cookie: str) -> bool:
+    try:
+        response = client.get(
+            "https://drive-pc.quark.cn/1/clouddrive/config",
+            headers=make_headers(cookie),
+            params=make_params(),
+            timeout=8,
+        )
+        return response.json().get("status") == 200
+    except Exception:
+        return False
+
+
+def api_get_stoken(client: httpx.Client, cookie: str, pwd_id: str) -> str:
+    response = client.post(
+        "https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token",
+        headers=make_headers(cookie),
+        params=make_params(),
+        json={"pwd_id": pwd_id, "passcode": ""},
         timeout=30,
     )
-    return _check(r.json(), "获取分享详情")
+    data = _check(response.json(), "获取 stoken")
+    stoken = data.get("stoken")
+    if not stoken:
+        raise QuarkError("stoken 为空，分享链接可能需要提取码或已失效")
+    return stoken
+
+
+def api_list_share_files(
+    client: httpx.Client,
+    cookie: str,
+    pwd_id: str,
+    stoken: str,
+) -> List[Dict[str, Any]]:
+    response = client.get(
+        "https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail",
+        headers=make_headers(cookie),
+        params=make_params({
+            "pwd_id": pwd_id,
+            "stoken": stoken,
+            "pdir_fid": "0",
+            "force": "0",
+            "_page": 1,
+            "_size": 50,
+            "_fetch_banner": 0,
+            "_fetch_share": 0,
+            "_fetch_total": 1,
+            "_sort": "file_type:asc,updated_at:desc",
+        }),
+        timeout=30,
+    )
+    data = _check(response.json(), "获取分享文件列表")
+    return data.get("list") or []
 
 
 def api_save_files(
     client: httpx.Client,
     cookie: str,
-    share_fid_list: List[str],
-    share_uk: str,
-    share_id: str,
+    pwd_id: str,
+    stoken: str,
+    fid_list: List[str],
+    fid_token_list: List[str],
     to_pdir_fid: str = "0",
-) -> Dict[str, Any]:
-    """转存文件"""
-    payload = {
-        "fid_list": share_fid_list,
-        "fid_tokens": [],
-        "to_pdir_fid": to_pdir_fid,
-        "share_uk": share_uk,
-        "share_id": share_id,
-        "scene": "link",
-    }
-    r = client.post(
-        "https://drive-pc.quark.cn/1/clouddrive/share/sharepage/save",
+) -> str:
+    response = client.post(
+        "https://drive.quark.cn/1/clouddrive/share/sharepage/save",
         headers=make_headers(cookie),
         params=make_params(),
-        json=payload,
+        json={
+        "fid_list": fid_list,
+        "fid_token_list": fid_token_list,
+        "to_pdir_fid": to_pdir_fid,
+        "pwd_id": pwd_id,
+        "stoken": stoken,
+        "pdir_fid": "0",
+        "scene": "link",
+        },
         timeout=30,
     )
-    return _check(r.json(), "转存")
+    data = _check(response.json(), "发起转存")
+    task_id = data.get("task_id")
+    if not task_id:
+        raise QuarkError("转存返回无 task_id")
+    return task_id
 
 
 def api_wait_task(client: httpx.Client, cookie: str, task_id: str, timeout: int = 60) -> Dict[str, Any]:
     """轮询等待任务完成"""
     start = time.time()
+    retry_index = 0
     while time.time() - start < timeout:
-        r = client.get(
+        response = client.get(
             "https://drive-pc.quark.cn/1/clouddrive/task",
             headers=make_headers(cookie),
-            params={**make_params(), "task_id": task_id, "retry_index": "0"},
+            params=make_params({"task_id": task_id, "retry_index": retry_index}),
             timeout=30,
         )
-        data = r.json()
-        if data.get("code") != 0:
-            raise RuntimeError(f"查询任务失败: {data.get('message')}")
-        
-        task_data = data.get("data", {})
+        task_data = _check(response.json(), "任务轮询")
         status = task_data.get("status")
-        
+
         if status == 2:
             return task_data
-        elif status == 4:
-            raise RuntimeError("任务失败")
-        
-        time.sleep(1)
-    
-    raise TimeoutError("等待任务超时")
+        if status == 4:
+            raise QuarkError("任务失败")
+
+        retry_index += 1
+        time.sleep(0.8)
+
+    raise QuarkError("等待任务超时")
+
+
+def api_list_items(client: httpx.Client, cookie: str, pdir_fid: str = "0") -> List[Dict[str, Any]]:
+    response = client.get(
+        "https://drive-pc.quark.cn/1/clouddrive/file/sort",
+        headers=make_headers(cookie),
+        params=make_params({
+            "pdir_fid": pdir_fid,
+            "_page": 1,
+            "_size": 100,
+            "_fetch_total": 0,
+            "_fetch_sub_dirs": 0,
+            "_sort": "file_type:asc,updated_at:desc",
+        }),
+        timeout=30,
+    )
+    data = _check(response.json(), "获取文件夹内容")
+    return data.get("list") or []
+
+
+def find_folder_fid(client: httpx.Client, cookie: str, folder_name: str) -> Optional[str]:
+    for item in api_list_items(client, cookie, "0"):
+        if item.get("file_type") == 0 and item.get("file_name") == folder_name:
+            return item.get("fid")
+    return None
+
+
+def find_saved_fids(items: List[Dict[str, Any]], file_names: List[str]) -> List[str]:
+    saved_fid_list: List[str] = []
+    for file_name in file_names:
+        for item in items:
+            if item.get("file_name") == file_name:
+                item_fid = item.get("fid")
+                if item_fid:
+                    saved_fid_list.append(item_fid)
+                break
+    return saved_fid_list
 
 
 def _random_passcode(length: int = 4) -> str:
@@ -234,8 +348,10 @@ def api_get_share_url(client: httpx.Client, cookie: str, share_id: str) -> str:
 # ============ 核心流程 ============
 def process_share(
     share_url: str,
-    cookie_file: Path,
+    cookie: Optional[str] = None,
+    cookie_file: Optional[Path] = None,
     save_to: str = "0",
+    to_folder: Optional[str] = None,
     title: Optional[str] = None,
     desc: Optional[str] = None,
     style: str = "urgent",
@@ -247,69 +363,89 @@ def process_share(
         "new_share_url": "",
         "passcode": "",
         "title": "",
+        "files": [],
         "copies": [],
         "error": "",
     }
     
-    if not cookie_file.exists():
-        result["error"] = f"Cookie 文件不存在: {cookie_file}"
-        return result
-    
-    cookie = cookie_file.read_text().strip()
+    if cookie and cookie.strip():
+        cookie = cookie.strip()
+    elif cookie_file is not None:
+        if not cookie_file.exists():
+            result["error"] = f"Cookie 文件不存在: {cookie_file}"
+            return result
+        cookie = load_cookie_from_file(cookie_file)
+    else:
+        cookie = ""
+
     if not cookie:
-        result["error"] = "Cookie 文件为空"
+        result["error"] = "未提供 cookie，请通过 --cookie 或 --cookie-file 传入登录态"
         return result
-    
+
+    ensure_httpx()
+
     with httpx.Client() as client:
         try:
             print(f"🚀 开始处理: {share_url}\n")
-            
+
+            print("🔑 验证登录状态...")
+            if not api_check_login(client, cookie):
+                result["error"] = "cookie 无效或已过期，请重新从夸克网盘浏览器中获取 cookie"
+                return result
+
+            target_folder_fid = save_to
+            if to_folder:
+                print(f"📁 查找目标文件夹: {to_folder}...")
+                folder_fid = find_folder_fid(client, cookie, to_folder)
+                if not folder_fid:
+                    result["error"] = f"网盘中未找到文件夹 '{to_folder}'，请先在网盘中创建该文件夹"
+                    return result
+                target_folder_fid = folder_fid
+                print(f"   ✅ 找到文件夹，fid={target_folder_fid}\n")
+
+            pwd_id = extract_pwd_id(share_url)
+
             # Step 1: 获取分享详情
             print("📥 步骤 1/3: 解析分享内容...")
-            share_detail = api_get_share_detail(client, share_url)
-            
-            share_uk = share_detail.get("uk", "")
-            share_id = share_detail.get("share_id", "")
-            file_list = share_detail.get("list", [])
-            
+            stoken = api_get_stoken(client, cookie, pwd_id)
+            file_list = api_list_share_files(client, cookie, pwd_id, stoken)
+
             if not file_list:
                 result["error"] = "分享为空或已失效"
                 return result
-            
+
             share_fid_list = [f["fid"] for f in file_list]
+            fid_token_list = [f["share_fid_token"] for f in file_list]
             file_names = [f["file_name"] for f in file_list]
-            
+            result["files"] = file_names
+
             if not title:
                 title = file_names[0] if len(file_names) == 1 else f"{file_names[0]} 等 {len(file_names)} 个文件"
-            
+
             print(f"   分享标题: {title}")
             print(f"   文件数量: {len(file_list)}\n")
-            
+
             # Step 2: 转存
             print("📥 步骤 2/3: 转存资源...")
-            save_result = api_save_files(
-                client, cookie, share_fid_list, share_uk, share_id, save_to
+            task_id = api_save_files(
+                client, cookie, pwd_id, stoken, share_fid_list, fid_token_list, target_folder_fid
             )
-            
-            task_id = save_result.get("task_id")
-            if task_id:
-                print(f"   等待转存完成...")
-                task_result = api_wait_task(client, cookie, task_id)
-                saved_fid_list = task_result.get("save_as", {}).get("saved_fid_list", [])
-            else:
-                saved_fid_list = save_result.get("saved_fid_list", [])
-            
-            if not saved_fid_list:
-                result["error"] = "转存失败：未获取到保存的文件ID"
-                return result
-            
+            print("   等待转存完成...")
+            api_wait_task(client, cookie, task_id)
+
             print(f"   ✅ 转存成功: {title}\n")
-            
+
             # Step 3: 创建分享
             print("📤 步骤 3/3: 创建分享...")
+            saved_items = api_list_items(client, cookie, target_folder_fid)
+            saved_fid_list = find_saved_fids(saved_items, file_names)
+            if not saved_fid_list:
+                result["error"] = "创建分享失败：转存后未找到文件ID"
+                return result
+
             share_title = file_names[0] if len(file_names) == 1 else f"{file_names[0]} 等 {len(file_names)} 个文件"
             share_data = api_create_share(client, cookie, saved_fid_list, title=share_title)
-            
+
             share_task_id = share_data.get("task_id")
             if share_task_id:
                 print(f"   等待分享创建完成...")
@@ -335,13 +471,15 @@ def process_share(
             result["new_share_url"] = new_share_url
             result["passcode"] = passcode
             result["title"] = title
-            
+
             # Step 4: 生成文案
             print("📝 生成 Twitter 文案...\n")
             copies = generate_copies(title, desc or "", new_share_url, style)
             result["copies"] = copies
             result["success"] = True
-            
+
+        except (ValueError, QuarkError, QuarkAuthError) as e:
+            result["error"] = str(e)
         except Exception as e:
             result["error"] = str(e)
     
@@ -392,7 +530,9 @@ def main():
     p_run.add_argument("--style", "-s", default="urgent",
                        choices=list(STYLE_TEMPLATES.keys()),
                        help="文案风格（默认: urgent）")
+    p_run.add_argument("--cookie", help="直接传入 cookie 字符串")
     p_run.add_argument("--save-to", default="0", help="转存目标文件夹ID")
+    p_run.add_argument("--to-folder", help="按文件夹名称查找目标目录（优先于 --save-to）")
     p_run.add_argument("--cookie-file", default=str(DEFAULT_COOKIE_FILE), help="cookie 文件路径")
     
     p_styles = subparsers.add_parser("styles", help="查看支持的文案风格")
@@ -410,8 +550,10 @@ def main():
     if args.command == "run":
         result = process_share(
             share_url=args.link,
+            cookie=args.cookie,
             cookie_file=Path(args.cookie_file),
             save_to=args.save_to,
+            to_folder=args.to_folder,
             title=args.title,
             desc=args.desc,
             style=args.style,

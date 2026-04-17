@@ -57,7 +57,7 @@ python scripts/quark_twitter_pipeline.py styles
 pip install httpx
 ```
 
-如果默认 cookie 文件不存在，可以通过参数显式指定路径。
+如果默认 cookie 文件不存在，可以通过参数显式指定路径，也可以直接传入 cookie 字符串。
 
 ## 输入参数
 
@@ -74,7 +74,9 @@ pip install httpx
 | --title, -t | 资源标题；未提供时，脚本会根据原分享内容自动推断 |
 | --desc, -d | 资源描述，用于生成文案 |
 | --style, -s | 文案风格，默认 urgent |
+| --cookie | 直接传入 cookie 字符串 |
 | --save-to | 转存目标文件夹 ID，默认 0，即根目录 |
+| --to-folder | 按文件夹名称查找目标目录，优先于 --save-to |
 | --cookie-file | cookie 文件路径，默认 ~/.quark_cookie.txt |
 
 ## 文案风格
@@ -95,7 +97,7 @@ pip install httpx
 当用户请求处理夸克分享链接时，按下面的顺序执行：
 
 1. 从用户输入中提取夸克分享链接。
-2. 确认是否需要覆盖默认参数，例如 title、desc、style、save-to、cookie-file。
+2. 确认是否需要覆盖默认参数，例如 title、desc、style、cookie、cookie-file、to-folder、save-to。
 3. 运行脚本的 run 子命令。
 4. 等待脚本完成转存和重新分享。
 5. 从结果中提取新分享链接、提取码和 3 个文案版本。
@@ -111,6 +113,7 @@ pip install httpx
 python scripts/quark_twitter_pipeline.py run "https://pan.quark.cn/s/xxx" \
     --title "资源标题" \
     --desc "资源描述" \
+    --to-folder "我的资源" \
     --style urgent
 ```
 
@@ -128,6 +131,8 @@ python scripts/quark_twitter_pipeline.py run "https://pan.quark.cn/s/xxx" \
 出现以下情况时，应直接向用户说明失败原因：
 
 - 分享链接无法解析。
+- cookie 未提供、无效或已过期。
+- 指定的目标文件夹不存在。
 - 原始分享为空或已失效。
 - cookie 文件不存在或为空。
 - 转存任务失败或超时。
